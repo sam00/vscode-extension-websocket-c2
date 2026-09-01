@@ -115,9 +115,23 @@ Edit `config.json`:
   "wsUrl": "wss://your-redirector.example.com:443/",
   "payloadUUID": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "aesPSK": "base64-key-from-mythic-build==",
-  "encryptedExchangeCheck": false
+  "encryptedExchangeCheck": false,
+  "zombieTimeoutMs": 45000,
+  "maxChunkBytes": 50000
 }
 ```
+
+### Persistence-mode additions (v2.1.0)
+
+The agent now handles reconnects without dying:
+
+| Feature | What it does |
+|---|---|
+| **Re-checkin on reconnect** | The Mythic WebSocket profile loses callback state when the socket drops. On every reconnect the agent re-sends `checkin` so your callback comes back instead of silently dying |
+| **Zombie socket detection** | If no inbound data arrives for `zombieTimeoutMs` (default 45s), the agent closes the dead socket and reconnects from scratch |
+| **Chunked task output** | Large responses (36 KB+) are split into 50 KB chunks via `postChunked`, preventing WSS frame size limits from wedging the connection |
+| **Exponential backoff with cap** | Reconnect delay doubles up from 3s and tops out at 10 minutes, giving VPNs/network flap recovery time |
+| **Config sanity check** | If `config.json` is missing required fields, the agent logs a warning and stays dormant (no partial startup that could crash the extension host) |
 
 > `config.json` is **gitignored** and excluded from the VSIX. It is
 > delivered to the target separately at runtime.

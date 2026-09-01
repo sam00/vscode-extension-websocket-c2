@@ -7,5 +7,7 @@
   "jitterPct": 30,
   "startDelayMs": 6000,
   "startJitterMs": 5000,
+  "zombieTimeoutMs": 45000,
+  "maxChunkBytes": 50000,
   "userAgent": "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko"
 }
