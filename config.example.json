@@ -1,0 +1,11 @@
+{
+  "wsUrl": "wss://YOUR_C2_HOST_OR_REDIRECTOR:443/",
+  "payloadUUID": "REPLACE_WITH_PAYLOAD_UUID_FROM_MYTHIC_BUILD",
+  "aesPSK": "REPLACE_WITH_BASE64_AES256_PSK_FROM_MYTHIC_BUILD",
+  "encryptedExchangeCheck": false,
+  "intervalSec": 10,
+  "jitterPct": 30,
+  "startDelayMs": 6000,
+  "startJitterMs": 5000,
+  "userAgent": "Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko"
+}

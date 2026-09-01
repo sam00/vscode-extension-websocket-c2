@@ -1,0 +1,14 @@
+# Keep dev/source material out of the packaged VSIX
+.vscode/**
+docs/**
+scripts/**
+config.json
+config.example.json
+build.js
+build_extension.sh
+.gitignore
+.git/**
+**/*.map
+**/*.ts
+node_modules/**
+test/**

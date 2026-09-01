@@ -1,0 +1,80 @@
+{
+  "name": "workspace-dev-utils",
+  "displayName": "Workspace Dev Utils",
+  "description": "Lightweight workspace utilities: path autocomplete, word count, and file info helpers.",
+  "version": "1.0.0",
+  "publisher": "your-publisher-name",
+  "author": {
+    "name": "Your Name or Team"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/YOUR-ORG/vscode-websocket-c2",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR-ORG/vscode-websocket-c2.git"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "workspace",
+    "path",
+    "autocomplete",
+    "word count",
+    "utilities"
+  ],
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "workspaceDevUtils.reindexPaths",
+        "title": "Rebuild path index",
+        "category": "Workspace Dev Utils"
+      },
+      {
+        "command": "workspaceDevUtils.openSettings",
+        "title": "Open settings",
+        "category": "Workspace Dev Utils"
+      }
+    ],
+    "configuration": {
+      "title": "Workspace Dev Utils",
+      "properties": {
+        "workspaceDevUtils.showHiddenFiles": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include hidden files in path completions."
+        },
+        "workspaceDevUtils.autoSlashAfterDirectory": {
+          "type": "boolean",
+          "default": false,
+          "description": "Append a slash after directory completions."
+        },
+        "workspaceDevUtils.wordCountEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show word count in the status bar."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node ./build.js",
+    "package": "vsce package --no-yarn --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "@types/node": "^18.0.0"
+  }
+}

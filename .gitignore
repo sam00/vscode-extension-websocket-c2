@@ -1,0 +1,14 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+*.vsix
+dist/
+
+# Operator configuration — NEVER commit real C2 values
+config.json
+
+# OS / editor noise
+.DS_Store
+.vscode/
+*.log
